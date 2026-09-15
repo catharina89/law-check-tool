@@ -1,0 +1,83 @@
+﻿=================================================================
+제안요청서 법령·지침 최신화 체크 도구 (웹 버전)
+배포 가이드 — GitHub 업로드 → Streamlit Cloud 배포
+=================================================================
+
+[이 폴더 안 파일]
+- app.py                        : 웹앱 전체 코드
+- requirements.txt               : 필요한 파이썬 라이브러리 목록
+- .streamlit/secrets.toml.example : OC 값 설정 예시 (실제 값은 여기 쓰지 마세요)
+- .gitignore                     : secrets.toml이 실수로 GitHub에 올라가지 않게 막음
+
+
+[1단계] GitHub에 새 저장소(repository) 만들기
+
+1. https://github.com 로그인
+2. 오른쪽 위 "+" 버튼 → "New repository"
+3. Repository name: law-check-tool (원하는 이름으로 변경 가능)
+4. Public 으로 설정 (Streamlit Cloud 무료 플랜은 Public 저장소만 지원)
+5. "Create repository" 클릭
+
+
+[2단계] 이 폴더의 파일들을 GitHub에 업로드
+
+가장 쉬운 방법 (브라우저로만 하는 방법):
+1. 방금 만든 저장소 페이지에서 "uploading an existing file" 링크 클릭
+   (또는 "Add file" → "Upload files")
+2. 이 폴더 안의 app.py, requirements.txt 를 끌어다 놓기
+   (.streamlit 폴더도 통째로 끌어다 놓으면 됩니다. secrets.toml.example만
+    올라가고, 실제 secrets.toml은 애초에 여기 없으니 안전합니다)
+3. 아래 "Commit changes" 버튼 클릭
+
+
+[3단계] Streamlit Community Cloud에서 배포
+
+1. https://share.streamlit.io 접속
+2. GitHub 계정으로 로그인 (처음이면 연동 승인)
+3. "Create app" 또는 "New app" 클릭
+4. Repository: 방금 만든 저장소 선택
+5. Branch: main
+6. Main file path: app.py
+7. "Deploy" 클릭
+
+몇 분 기다리면 다음과 같은 형태의 링크가 생성됩니다:
+https://law-check-tool-xxxxx.streamlit.app/
+
+이 링크를 심사위원께 공유하시면 됩니다.
+
+
+[4단계] OC 인증키를 안전하게 설정 (선택, 강력 권장)
+
+배포된 앱은 화면에서 직접 OC를 입력해도 동작하지만, 매번 입력하지
+않도록 미리 심어둘 수도 있습니다:
+
+1. Streamlit Cloud 대시보드에서 방금 배포한 앱 클릭
+2. 오른쪽 위 "⋮" 메뉴 → "Settings" → "Secrets"
+3. 아래처럼 입력:
+
+   LAW_API_OC = "본인의_OC값"
+
+4. "Save" 클릭하면 앱이 자동 재시작되며, 이후 사이드바에
+   OC 값이 자동으로 미리 채워집니다.
+
+※ 이 값은 GitHub 코드에는 절대 들어가지 않고, Streamlit 서버에만
+  안전하게 저장됩니다.
+
+
+[시연 시 참고]
+
+- 탭1 "직접 입력해서 조회": 법령명 하나를 입력하고 바로 결과를 보여주는
+  방식이라 심사위원 앞에서 시연하기 좋습니다.
+- 탭2 "여러 건 한번에 조회": 샘플 엑셀 양식을 내려받아 채운 뒤
+  업로드하면 일괄 조회됩니다. 실제 업무에서 쓰는 방식과 동일합니다.
+- "구분 자동보정" 기능: 법령/행정규칙/자치법규 구분을 잘못 입력해도
+  자동으로 재검색해서 맞는 걸 찾아주는 부분이 이 도구의 핵심
+  차별점이니, 시연 시 일부러 구분을 틀리게 입력해서 보여주면
+  좋은 어필 포인트가 됩니다.
+
+
+[문제가 생기면]
+- Streamlit Cloud 배포 화면에 나오는 오류 로그를 캡쳐해서 보여주시면
+  원인을 파악해드릴 수 있습니다.
+- "requirements.txt에 없는 라이브러리" 오류가 나면, 제가 requirements.txt에
+  빠뜨린 패키지가 있는지 확인이 필요합니다.
