@@ -224,57 +224,17 @@ def read_document_text(uploaded_file):
         except Exception as e:
             return None, f"docx 파일을 읽지 못했습니다: {e}"
 
-    if name.endswith(".hwpx"):
-        try:
-            from extract_hwp import extract_text_from_hwpx
-            import tempfile, os
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwpx") as tmp:
-                tmp.write(raw_bytes)
-                tmp_path = tmp.name
-            try:
-                text = extract_text_from_hwpx(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            if not text or not text.strip():
-                return None, "hwpx 파일에서 텍스트를 추출하지 못했습니다 (빈 문서이거나 보안 적용 파일일 수 있습니다)."
-            return text, None
-        except Exception as e:
-            return None, f"hwpx 파일을 읽지 못했습니다: {e}"
-
-    if name.endswith(".hwp"):
-        try:
-            from extract_hwp import extract_text_from_hwp, is_hwp_file_password_protected
-            import tempfile, os
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
-                tmp.write(raw_bytes)
-                tmp_path = tmp.name
-            try:
-                if is_hwp_file_password_protected(tmp_path):
-                    return None, "암호로 보호된 hwp 파일입니다. 암호를 해제한 뒤 다시 올려주세요."
-                text, err = extract_text_from_hwp(tmp_path)
-            finally:
-                os.unlink(tmp_path)
-            if err:
-                return None, (
-                    f"hwp 파일을 읽지 못했습니다: {err}\n\n"
-                    "문서보안(DRM)이 적용된 파일일 수 있습니다. "
-                    "한글에서 '다른 이름으로 저장 → hwpx 또는 docx'로 변환해 다시 올려보세요."
-                )
-            if not text or not text.strip():
-                return None, (
-                    "hwp 파일에서 텍스트를 추출하지 못했습니다. "
-                    "문서보안(DRM)이 적용된 파일일 수 있습니다. "
-                    "한글에서 hwpx 또는 docx로 저장해 다시 올려보세요."
-                )
-            return text, None
-        except ImportError:
-            return None, "hwp 처리 라이브러리를 불러오지 못했습니다. (requirements.txt 확인 필요)"
-        except Exception as e:
+    if name.endswith(".hwpx") or name.endswith(".hwp"):
+        from hwp_reader import extract_text_auto
+        text, err = extract_text_auto(raw_bytes, uploaded_file.name)
+        if err:
             return None, (
-                f"hwp 파일을 읽지 못했습니다: {e}\n\n"
-                "문서보안(DRM)이 적용된 파일일 수 있습니다. "
-                "한글에서 hwpx 또는 docx로 저장해 다시 올려보세요."
+                f"{err}\n\n"
+                "문서보안(DRM)이 적용된 파일이거나 형식이 특이한 경우일 수 있습니다. "
+                "한글에서 '다른 이름으로 저장'으로 hwpx 또는 docx로 저장해 다시 올려보시거나, "
+                "아래 '본문을 붙여넣어 검사하기'를 이용해주세요."
             )
+        return text, None
 
     return None, "지원하지 않는 파일 형식입니다. (hwp, hwpx, docx, txt만 가능)"
 
