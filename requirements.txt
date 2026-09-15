@@ -1,3 +1,6 @@
 streamlit>=1.30
 pandas>=2.0
 openpyxl>=3.1
+python-docx>=1.1
+extract-hwp==0.1.0
+olefile>=0.46

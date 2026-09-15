@@ -19,7 +19,6 @@ from datetime import datetime
 
 import pandas as pd
 import streamlit as st
-
 # ------------------------------------------------------------------
 # 기본 설정
 # ------------------------------------------------------------------
@@ -117,6 +116,169 @@ def normalize_name(s):
     return re.sub(r"\s+", "", s)
 
 
+# ------------------------------------------------------------------
+# 제안요청서 본문에서 법령명 자동 추출
+# ------------------------------------------------------------------
+LAW_SUFFIXES = (
+    "법", "법률", "시행령", "시행규칙", "기본법",
+    "지침", "고시", "예규", "훈령", "조례", "규칙", "요령", "기준",
+)
+
+NOISE_PATTERNS = [
+    re.compile(r'^제\s*\d+\s*장'),
+    re.compile(r'다음\s*각\s*호'),
+    re.compile(r'수행자'),
+    re.compile(r'^(관련|기타|해당|위|아래)\s'),
+    re.compile(r'(관련|각\s*호의)\s*법'),
+    re.compile(r'^(및|또|그|이하|령)'),
+    re.compile(r'하여야|해야|한다$|따른다$'),
+    re.compile(r'^\s*$'),
+]
+
+SHORT_LAW_WHITELIST = {
+    "민법", "상법", "헌법", "형법", "세법", "특허법", "저작권법",
+}
+
+
+def clean_law_name(name):
+    """추출된 문자열에서 조항·부가설명·번호·조사를 떼어내 법령명만 남긴다."""
+    if not name:
+        return ""
+    s = name.strip()
+    s = re.sub(r'^\s*\d+[.)]\s*', '', s)
+    s = re.sub(r'^[ㅇ□○·▪▫◦\-\s]+', '', s)
+    s = re.sub(r'\s*제\s*\d+\s*조.*$', '', s)
+    s = re.sub(r'\s*제\s*\d+\s*항.*$', '', s)
+    s = re.sub(r'\s*\([^)]*\)\s*$', '', s)
+    s = re.sub(r'(및|과|와|등|을|를|은|는|이|가)$', '', s).strip()
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip()
+
+
+def looks_like_law(name):
+    """법령명처럼 보이는지 판정해 문장 조각 등 노이즈를 걸러낸다."""
+    if not name or len(name) < 2 or len(name) > 45:
+        return False
+    if not name.endswith(LAW_SUFFIXES):
+        return False
+    for pat in NOISE_PATTERNS:
+        if pat.search(name):
+            return False
+    if name.endswith("법") and len(name) <= 3 and name not in SHORT_LAW_WHITELIST:
+        return False
+    return True
+
+
+def extract_law_names(text):
+    """
+    본문에서 법령명을 추출한다.
+    공문서는 법령명을 「 」 안에 넣는 관행이 있어 이를 1차 기준으로 삼고,
+    낫표가 거의 없는 문서는 줄 단위 목록 형태만 보조로 인정한다.
+    """
+    results = []
+    bracket_matches = re.findall(r'[「『]([^」』]{2,60})[」』]', text)
+    for m in bracket_matches:
+        c = clean_law_name(m)
+        if looks_like_law(c) and c not in results:
+            results.append(c)
+
+    if len(bracket_matches) < 2:
+        for line in text.split('\n'):
+            line = line.strip()
+            if not line or len(line) > 50:
+                continue
+            c = clean_law_name(line)
+            if looks_like_law(c) and c not in results:
+                results.append(c)
+
+    return results
+
+
+def read_document_text(uploaded_file):
+    """
+    업로드된 파일에서 텍스트를 추출한다.
+    hwp / hwpx / docx / txt 를 지원하며, 실패 시 (None, 오류메시지)를 반환한다.
+    """
+    name = uploaded_file.name.lower()
+    raw_bytes = uploaded_file.read()
+
+    if name.endswith(".txt"):
+        for enc in ("utf-8", "cp949", "utf-8-sig"):
+            try:
+                return raw_bytes.decode(enc), None
+            except UnicodeDecodeError:
+                continue
+        return None, "텍스트 파일 인코딩을 인식하지 못했습니다."
+
+    if name.endswith(".docx"):
+        try:
+            import docx  # python-docx
+            doc = docx.Document(io.BytesIO(raw_bytes))
+            parts = [p.text for p in doc.paragraphs]
+            # 표 안의 텍스트도 수집 (법령 목록이 표에 들어있는 경우가 많음)
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        parts.append(cell.text)
+            return "\n".join(parts), None
+        except Exception as e:
+            return None, f"docx 파일을 읽지 못했습니다: {e}"
+
+    if name.endswith(".hwpx"):
+        try:
+            from extract_hwp import extract_text_from_hwpx
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwpx") as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                text = extract_text_from_hwpx(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+            if not text or not text.strip():
+                return None, "hwpx 파일에서 텍스트를 추출하지 못했습니다 (빈 문서이거나 보안 적용 파일일 수 있습니다)."
+            return text, None
+        except Exception as e:
+            return None, f"hwpx 파일을 읽지 못했습니다: {e}"
+
+    if name.endswith(".hwp"):
+        try:
+            from extract_hwp import extract_text_from_hwp, is_hwp_file_password_protected
+            import tempfile, os
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".hwp") as tmp:
+                tmp.write(raw_bytes)
+                tmp_path = tmp.name
+            try:
+                if is_hwp_file_password_protected(tmp_path):
+                    return None, "암호로 보호된 hwp 파일입니다. 암호를 해제한 뒤 다시 올려주세요."
+                text, err = extract_text_from_hwp(tmp_path)
+            finally:
+                os.unlink(tmp_path)
+            if err:
+                return None, (
+                    f"hwp 파일을 읽지 못했습니다: {err}\n\n"
+                    "문서보안(DRM)이 적용된 파일일 수 있습니다. "
+                    "한글에서 '다른 이름으로 저장 → hwpx 또는 docx'로 변환해 다시 올려보세요."
+                )
+            if not text or not text.strip():
+                return None, (
+                    "hwp 파일에서 텍스트를 추출하지 못했습니다. "
+                    "문서보안(DRM)이 적용된 파일일 수 있습니다. "
+                    "한글에서 hwpx 또는 docx로 저장해 다시 올려보세요."
+                )
+            return text, None
+        except ImportError:
+            return None, "hwp 처리 라이브러리를 불러오지 못했습니다. (requirements.txt 확인 필요)"
+        except Exception as e:
+            return None, (
+                f"hwp 파일을 읽지 못했습니다: {e}\n\n"
+                "문서보안(DRM)이 적용된 파일일 수 있습니다. "
+                "한글에서 hwpx 또는 docx로 저장해 다시 올려보세요."
+            )
+
+    return None, "지원하지 않는 파일 형식입니다. (hwp, hwpx, docx, txt만 가능)"
+
+
 def _search_one_target(oc, target, query_name):
     params = {"OC": oc, "target": target, "type": "XML", "query": query_name, "display": 5}
     try:
@@ -189,7 +351,142 @@ with st.sidebar:
 if not oc:
     st.info("👈 왼쪽 사이드바에 API 인증키(OC)를 입력하면 조회를 시작할 수 있습니다.")
 
-tab1, tab2 = st.tabs(["📝 직접 입력해서 조회", "📊 여러 건 한번에 조회 (엑셀 업로드)"])
+tab0, tab1, tab2 = st.tabs([
+    "📄 제안요청서 파일 검사 (권장)",
+    "📝 법령명 직접 입력",
+    "📊 엑셀로 여러 건 조회",
+])
+
+# ---- 탭 0: 제안요청서 파일 업로드 → 법령명 자동 추출 → 일괄 검사 ----
+with tab0:
+    st.subheader("제안요청서 파일을 올리면 법령명을 자동으로 찾아 검사합니다")
+    st.caption(
+        "문서 안의 법령·지침명을 자동으로 추출한 뒤, 국가법령정보센터와 대조하여 "
+        "**미현행(폐지·명칭변경)된 항목**을 찾아냅니다."
+    )
+
+    doc_file = st.file_uploader(
+        "제안요청서 파일 업로드",
+        type=["hwp", "hwpx", "docx", "txt"],
+        help="한글(hwp/hwpx), 워드(docx), 텍스트(txt) 파일을 지원합니다.",
+        key="doc_upload",
+    )
+
+    with st.expander("📋 파일 없이 본문을 붙여넣어 검사하기"):
+        pasted_text = st.text_area(
+            "제안요청서의 관련 법령 부분을 복사해서 붙여넣으세요",
+            height=180,
+            placeholder="예:\n1. 「개인정보 보호법」\n2. 「전자정부법」 제45조\n3. 「국가정보화 기본법」",
+            key="pasted_text",
+        )
+
+    doc_text = None
+    read_error = None
+
+    if doc_file is not None:
+        with st.spinner("문서에서 텍스트를 추출하는 중..."):
+            doc_text, read_error = read_document_text(doc_file)
+        if read_error:
+            st.error(read_error)
+    elif pasted_text and pasted_text.strip():
+        doc_text = pasted_text
+
+    if doc_text:
+        found_laws = extract_law_names(doc_text)
+
+        if not found_laws:
+            st.warning(
+                "문서에서 법령명을 찾지 못했습니다. "
+                "법령명이 「 」 표기 없이 문장 속에 섞여 있으면 인식이 어려울 수 있습니다. "
+                "아래 '법령명 직접 입력' 탭을 이용하거나, 관련 법령 부분만 붙여넣어 보세요."
+            )
+        else:
+            st.success(f"문서에서 법령·지침 {len(found_laws)}건을 찾았습니다.")
+
+            # 사용자가 추출 결과를 확인/수정할 수 있게 표시
+            edited = st.data_editor(
+                pd.DataFrame({"검사대상 법령·지침명": found_laws}),
+                use_container_width=True,
+                num_rows="dynamic",
+                key="extracted_editor",
+            )
+
+            st.caption("💡 잘못 추출된 항목은 위 표에서 직접 지우거나 고칠 수 있습니다.")
+
+            if st.button("🔍 전체 검사 시작", type="primary", disabled=not oc, key="doc_check_btn"):
+                targets = [
+                    str(v).strip() for v in edited["검사대상 법령·지침명"].tolist()
+                    if str(v).strip() and str(v).strip().lower() != "nan"
+                ]
+                results = []
+                progress = st.progress(0, text="검사 준비 중...")
+                for i, name in enumerate(targets):
+                    progress.progress((i + 1) / len(targets), text=f"검사 중: {name}")
+                    r = check_one(oc, "법령", name)
+                    official_name = r.get("name") or ""
+                    is_match = official_name and normalize_name(official_name) == normalize_name(name)
+                    if r.get("error"):
+                        status = "⚠️ 확인필요"
+                        note = "국가법령정보센터에서 찾지 못했습니다. 폐지되었거나 명칭이 바뀐 법령일 수 있습니다."
+                    elif is_match and r.get("auto_corrected_from"):
+                        status = "✅ 현행"
+                        note = f"{r.get('auto_corrected_to')}(으)로 확인됨"
+                    elif is_match:
+                        status = "✅ 현행"
+                        note = ""
+                    else:
+                        status = "❗ 미현행 의심"
+                        note = f"문서의 명칭과 다릅니다. 현재 정식명칭: {official_name}"
+                    results.append({
+                        "문서에 적힌 명칭": name,
+                        "상태": status,
+                        "현행 정식명칭": official_name,
+                        "최신 시행일자": format_date(r.get("enforce_date")),
+                        "소관부처": r.get("dept") or "",
+                        "조치 안내": note,
+                    })
+                    time.sleep(0.3)
+                progress.empty()
+
+                result_df = pd.DataFrame(results)
+
+                # 요약
+                n_ok = sum(1 for r in results if r["상태"] == "✅ 현행")
+                n_warn = sum(1 for r in results if r["상태"] == "❗ 미현행 의심")
+                n_check = sum(1 for r in results if r["상태"] == "⚠️ 확인필요")
+
+                c1, c2, c3 = st.columns(3)
+                c1.metric("✅ 현행", f"{n_ok}건")
+                c2.metric("❗ 미현행 의심", f"{n_warn}건")
+                c3.metric("⚠️ 확인필요", f"{n_check}건")
+
+                if n_warn or n_check:
+                    st.warning(
+                        f"수정이 필요할 수 있는 항목이 {n_warn + n_check}건 있습니다. "
+                        "아래 표의 '조치 안내'를 확인하세요."
+                    )
+                else:
+                    st.success("모든 법령·지침이 현행 명칭과 일치합니다.")
+
+                def highlight_status(row):
+                    if row["상태"] == "✅ 현행":
+                        return ["background-color: #C6EFCE"] * len(row)
+                    elif row["상태"] == "❗ 미현행 의심":
+                        return ["background-color: #FFC7CE"] * len(row)
+                    else:
+                        return ["background-color: #FFEB9C"] * len(row)
+
+                st.dataframe(
+                    result_df.style.apply(highlight_status, axis=1),
+                    use_container_width=True,
+                )
+
+                st.download_button(
+                    "📥 검사 결과 CSV 다운로드",
+                    data=result_df.to_csv(index=False).encode("utf-8-sig"),
+                    file_name=f"제안요청서_법령검사결과_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime="text/csv",
+                )
 
 # ---- 탭 1: 단건 직접 입력 조회 ----
 with tab1:
