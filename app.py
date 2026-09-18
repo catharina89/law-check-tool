@@ -74,30 +74,45 @@ def parse_search_result(xml_bytes):
     if total_count is not None and total_count.strip() == "0":
         return {"error": "검색결과 없음"}
 
-    first_item = None
+    items = []
     for tag in ["law", "admrul", "ordin"]:
-        items = root.findall(f".//{tag}")
-        if items:
-            first_item = items[0]
+        found = root.findall(f".//{tag}")
+        if found:
+            items = found
             break
-    if first_item is None:
+    if not items:
         children = list(root)
         if children:
             for child in children[1:]:
                 if list(child):
-                    first_item = child
+                    items = [child]
                     break
-    if first_item is None:
+    if not items:
         return {"error": "응답 구조를 해석하지 못함"}
 
-    name = find_first_text(first_item, ["법령명한글", "행정규칙명", "자치법규명", "법령명"])
-    proclaim_date = find_first_text(first_item, ["공포일자"])
-    enforce_date = find_first_text(first_item, ["시행일자"])
-    dept = find_first_text(first_item, ["소관부처명", "소관부처"])
+    candidates = []
+    for item in items:
+        nm = find_first_text(item, ["법령명한글", "행정규칙명", "자치법규명", "법령명"])
+        if not nm:
+            continue
+        candidates.append({
+            "name": nm,
+            "proclaim_date": find_first_text(item, ["공포일자"]),
+            "enforce_date": find_first_text(item, ["시행일자"]),
+            "dept": find_first_text(item, ["소관부처명", "소관부처"]),
+        })
 
+    if not candidates:
+        return {"error": "응답에서 법령명을 찾지 못함"}
+
+    first = candidates[0]
     return {
-        "name": name, "proclaim_date": proclaim_date,
-        "enforce_date": enforce_date, "dept": dept, "error": None,
+        "name": first["name"],
+        "proclaim_date": first["proclaim_date"],
+        "enforce_date": first["enforce_date"],
+        "dept": first["dept"],
+        "candidates": candidates,
+        "error": None,
     }
 
 
@@ -133,6 +148,10 @@ NOISE_PATTERNS = [
     re.compile(r'^(및|또|그|이하|령)'),
     re.compile(r'하여야|해야|한다$|따른다$'),
     re.compile(r'^\s*$'),
+    # 앞 문장을 가리키는 지시어 — 그 자체로는 법령명이 아니다.
+    # 예: "동법 시행령", "같은 법 시행규칙", "본 법", "위 법률"
+    re.compile(r'^(동법|동\s|같은\s*법|본\s*법|당해|상기|전기)'),
+    re.compile(r'^(위|아래|앞)\s*(법|법률)'),
 ]
 
 SHORT_LAW_WHITELIST = {
@@ -182,14 +201,19 @@ def extract_law_names(text):
         if looks_like_law(c) and c not in results:
             results.append(c)
 
-    if len(bracket_matches) < 2:
-        for line in text.split('\n'):
-            line = line.strip()
-            if not line or len(line) > 50:
-                continue
-            c = clean_law_name(line)
-            if looks_like_law(c) and c not in results:
-                results.append(c)
+    # 낫표 없이 적힌 지침·기준·고시도 함께 잡는다.
+    # (실제 제안요청서는 「법령」과 낫표 없는 지침이 섞여 있는 경우가 많다)
+    # 문장 중간이 아니라, 한 줄이 곧 하나의 항목인 목록 형태만 인정한다.
+    for line in text.split('\n'):
+        line = line.strip()
+        if not line or len(line) > 50:
+            continue
+        # 이미 낫표로 잡은 줄은 건너뛴다 (중복·부분추출 방지)
+        if '「' in line or '『' in line:
+            continue
+        c = clean_law_name(line)
+        if looks_like_law(c) and c not in results:
+            results.append(c)
 
     return results
 
@@ -240,43 +264,100 @@ def read_document_text(uploaded_file):
 
 
 def _search_one_target(oc, target, query_name):
-    params = {"OC": oc, "target": target, "type": "XML", "query": query_name, "display": 5}
+    params = {"OC": oc, "target": target, "type": "XML", "query": query_name, "display": 20}
     try:
         raw = http_get(SEARCH_URL, params)
     except Exception as e:
         return {"error": f"네트워크 오류: {e}"}
-    return parse_search_result(raw)
+
+    result = parse_search_result(raw)
+    if result.get("error"):
+        return result
+
+    # 후보 중 입력명과 정확히 일치하는 것이 있으면 그것을 대표로 올린다.
+    # (법령센터는 관련도순으로 주기 때문에 1번이 정답이 아닐 수 있다)
+    target_norm = normalize_name(query_name)
+    for cand in result.get("candidates", []):
+        if normalize_name(cand["name"]) == target_norm:
+            result["name"] = cand["name"]
+            result["proclaim_date"] = cand["proclaim_date"]
+            result["enforce_date"] = cand["enforce_date"]
+            result["dept"] = cand["dept"]
+            break
+
+    result["searched_target"] = target
+    return result
+
+
+def _similarity(a, b):
+    """두 법령명의 유사도(0~1). 표준 difflib 사용."""
+    import difflib
+    return difflib.SequenceMatcher(None, normalize_name(a), normalize_name(b)).ratio()
 
 
 def check_one(oc, gubun, query_name):
-    """지정 구분으로 우선 검색, 불일치/실패 시 다른 구분으로 자동 재시도."""
+    """
+    지정 구분으로 우선 검색하고, 정확히 일치하지 않으면 다른 구분으로도 재시도한다.
+    어느 구분에서도 정확 일치가 없으면, 모든 구분에서 모은 후보를 유사도 순으로
+    정렬해 'similar_candidates'로 돌려준다 (담당자가 바로 판단할 수 있도록).
+    """
     primary_target = TARGET_MAP.get(gubun, "law")
-    primary_result = _search_one_target(oc, primary_target, query_name)
-    primary_ok = (
-        not primary_result.get("error")
-        and primary_result.get("name")
-        and normalize_name(primary_result["name"]) == normalize_name(query_name)
-    )
-    if primary_ok:
-        primary_result["matched_target"] = primary_target
-        return primary_result
+    order = [primary_target] + [t for t in ("law", "admrul", "ordin") if t != primary_target]
 
-    other_targets = [t for t in ("law", "admrul", "ordin") if t != primary_target]
-    for alt_target in other_targets:
-        alt_result = _search_one_target(oc, alt_target, query_name)
-        alt_ok = (
-            not alt_result.get("error")
-            and alt_result.get("name")
-            and normalize_name(alt_result["name"]) == normalize_name(query_name)
-        )
-        if alt_ok:
-            alt_result["matched_target"] = alt_target
-            alt_result["auto_corrected_from"] = GUBUN_LABELS.get(primary_target, primary_target)
-            alt_result["auto_corrected_to"] = GUBUN_LABELS.get(alt_target, alt_target)
-            return alt_result
+    all_candidates = []   # (유사도, 후보dict, target)
+    first_result = None
 
-    primary_result["matched_target"] = primary_target
-    return primary_result
+    for idx, target in enumerate(order):
+        result = _search_one_target(oc, target, query_name)
+        if idx == 0:
+            first_result = result
+
+        if result.get("error"):
+            continue
+
+        # 정확 일치를 찾으면 즉시 확정
+        if result.get("name") and normalize_name(result["name"]) == normalize_name(query_name):
+            result["matched_target"] = target
+            if target != primary_target:
+                result["auto_corrected_from"] = GUBUN_LABELS.get(primary_target, primary_target)
+                result["auto_corrected_to"] = GUBUN_LABELS.get(target, target)
+            return result
+
+        # 정확 일치가 아니면 후보로 쌓아둔다
+        for cand in result.get("candidates", []):
+            all_candidates.append((
+                _similarity(query_name, cand["name"]),
+                cand,
+                target,
+            ))
+
+    # 정확 일치 없음 -> 유사 후보를 유사도 순으로 정리해 반환
+    all_candidates.sort(key=lambda x: x[0], reverse=True)
+
+    seen = set()
+    similar = []
+    for score, cand, target in all_candidates:
+        key = normalize_name(cand["name"])
+        if key in seen:
+            continue
+        seen.add(key)
+        similar.append({
+            "name": cand["name"],
+            "enforce_date": cand["enforce_date"],
+            "dept": cand["dept"],
+            "gubun": GUBUN_LABELS.get(target, target),
+            "similarity": round(score * 100),
+        })
+        if len(similar) >= 5:
+            break
+
+    base = first_result if first_result else {"error": "검색결과 없음"}
+    if similar:
+        base = dict(base)
+        base["error"] = None if base.get("name") else base.get("error")
+        base["similar_candidates"] = similar
+    base["matched_target"] = primary_target
+    return base
 
 
 # ------------------------------------------------------------------
@@ -385,18 +466,39 @@ with tab0:
                     r = check_one(oc, "법령", name)
                     official_name = r.get("name") or ""
                     is_match = official_name and normalize_name(official_name) == normalize_name(name)
-                    if r.get("error"):
-                        status = "⚠️ 확인필요"
-                        note = "국가법령정보센터에서 찾지 못했습니다. 폐지되었거나 명칭이 바뀐 법령일 수 있습니다."
-                    elif is_match and r.get("auto_corrected_from"):
+                    similar = r.get("similar_candidates") or []
+
+                    def _fmt_similar(cands, limit=3):
+                        parts = []
+                        for c in cands[:limit]:
+                            date = format_date(c.get("enforce_date"))
+                            piece = f"{c['name']} [{c['gubun']}"
+                            if date:
+                                piece += f", 시행 {date}"
+                            piece += f", 유사도 {c['similarity']}%]"
+                            parts.append(piece)
+                        return " / ".join(parts)
+
+                    if is_match and r.get("auto_corrected_from"):
                         status = "✅ 현행"
                         note = f"{r.get('auto_corrected_to')}(으)로 확인됨"
                     elif is_match:
                         status = "✅ 현행"
                         note = ""
+                    elif similar:
+                        # 정확히 일치하진 않지만 비슷한 것이 있음 -> 담당자 판단용 후보 제시
+                        status = "❗ 미현행 의심"
+                        note = "정확히 일치하는 법령이 없습니다. 유사 후보: " + _fmt_similar(similar)
+                    elif r.get("error"):
+                        status = "⚠️ 확인필요"
+                        note = (
+                            "국가법령정보센터에서 찾지 못했습니다. "
+                            "폐지되었거나 명칭이 바뀐 법령이거나, 법령명이 아닐 수 있습니다."
+                        )
                     else:
                         status = "❗ 미현행 의심"
                         note = f"문서의 명칭과 다릅니다. 현재 정식명칭: {official_name}"
+
                     results.append({
                         "문서에 적힌 명칭": name,
                         "상태": status,
@@ -464,7 +566,9 @@ with tab1:
             with st.spinner(f"'{query_name}' 조회 중..."):
                 result = check_one(oc, gubun, query_name.strip())
 
-            if result.get("error"):
+            similar = result.get("similar_candidates") or []
+
+            if result.get("error") and not similar:
                 st.error(f"❌ 확인필요: {result['error']}")
                 st.caption("법령명을 다시 확인하시거나, law.go.kr에서 직접 검색해보세요.")
             else:
@@ -481,13 +585,32 @@ with tab1:
                         f"'{corrected_to}'(으)로 재검색하여 일치를 확인했습니다."
                     )
                 else:
-                    st.warning("⚠️ 불일치: 입력명과 조회된 정식명칭이 다릅니다.")
+                    st.warning("⚠️ 정확히 일치하는 법령을 찾지 못했습니다.")
 
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("조회된 정식명칭", official_name or "-")
-                c2.metric("공포일자", format_date(result.get("proclaim_date")) or "-")
-                c3.metric("최신 시행일자", format_date(result.get("enforce_date")) or "-")
-                c4.metric("소관부처", result.get("dept") or "-")
+                if is_match:
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("조회된 정식명칭", official_name or "-")
+                    c2.metric("공포일자", format_date(result.get("proclaim_date")) or "-")
+                    c3.metric("최신 시행일자", format_date(result.get("enforce_date")) or "-")
+                    c4.metric("소관부처", result.get("dept") or "-")
+
+                if similar:
+                    st.markdown("**혹시 이것을 찾으셨나요? (유사 후보)**")
+                    sim_df = pd.DataFrame([
+                        {
+                            "정식명칭": c["name"],
+                            "구분": c["gubun"],
+                            "최신 시행일자": format_date(c.get("enforce_date")),
+                            "소관부처": c.get("dept") or "",
+                            "유사도": f"{c['similarity']}%",
+                        }
+                        for c in similar
+                    ])
+                    st.dataframe(sim_df, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "💡 문서에 적힌 명칭이 약칭이거나 앞부분(기관명 등)이 빠진 경우 "
+                        "이렇게 나타납니다. 위 정식명칭으로 수정하시면 됩니다."
+                    )
 
 # ---- 탭 2: 엑셀 업로드로 일괄 조회 ----
 with tab2:
